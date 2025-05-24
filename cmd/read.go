@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/mail"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -16,10 +17,10 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	"github.com/jaytaylor/html2text"
 	"github.com/urfave/cli/v3"
 )
 
@@ -137,7 +138,7 @@ func (a *App) loadEmails() tea.Cmd {
 		}
 		a.client = client
 
-		emails, err := fetchEmailsSmart(client)
+		emails, err := fetchEmails(client)
 		if err != nil {
 			return errorMsg(err)
 		}
@@ -319,8 +320,32 @@ var (
 			Foreground(lipgloss.Color("252"))
 )
 
+// Clean up excessive whitespace and formatting
+func cleanupWhitespace(text string) string {
+	// Normalize line endings
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	// Remove trailing spaces from lines
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	text = strings.Join(lines, "\n")
+
+	// Reduce multiple consecutive blank lines to maximum of 2
+	for strings.Contains(text, "\n\n\n\n") {
+		text = strings.ReplaceAll(text, "\n\n\n\n", "\n\n\n")
+	}
+
+	// Remove leading/trailing whitespace
+	text = strings.TrimSpace(text)
+
+	return text
+}
+
 // Smart email fetching - load headers first, bodies on demand
-func fetchEmailsSmart(imapClient *client.Client) ([]Email, error) {
+func fetchEmails(imapClient *client.Client) ([]Email, error) {
 	mailbox, err := imapClient.Select("INBOX", false)
 	if err != nil {
 		return nil, err
@@ -512,23 +537,13 @@ func parseEmailBody(rawBody string) (Email, error) {
 		}
 	}
 
-	// Convert HTML to readable text if we have HTML content
-	if email.HTMLBody != "" {
-		text, err := html2text.FromString(email.HTMLBody, html2text.Options{
-			PrettyTables: true,
-			PrettyTablesOptions: &html2text.PrettyTablesOptions{
-				AutoFormatHeader: true,
-				AutoWrapText:     true,
-			},
-			OmitLinks: false,
-		})
-		if err == nil {
-			email.Body = text
-		} else {
-			email.Body = email.HTMLBody // Fallback to raw HTML
-		}
-	} else if email.TextBody != "" {
+	// Convert HTML to Markdown if we have HTML content
+	if email.TextBody != "" {
 		email.Body = email.TextBody
+	} else {
+		if email.HTMLBody != "" {
+			email.Body = email.HTMLBody
+		}
 	}
 
 	return email, nil
@@ -553,28 +568,29 @@ func formatEmailForView(email Email) string {
 	if email.Body != "" {
 		// Clean up the body text
 		body := strings.TrimSpace(email.Body)
-		body = strings.ReplaceAll(body, "\r\n", "\n")
-		body = strings.ReplaceAll(body, "\r", "\n")
+		body = cleanupWhitespace(body)
 
-		// Remove excessive blank lines
-		lines := strings.Split(body, "\n")
-		var cleanLines []string
-		var blankCount int
+		// Create glamour renderer with auto-style
+		r, err := glamour.NewTermRenderer(
+			glamour.WithAutoStyle(),
+			glamour.WithWordWrap(80),
+		)
 
-		for _, line := range lines {
-			if strings.TrimSpace(line) == "" {
-				blankCount++
-				if blankCount <= 2 { // Allow max 2 consecutive blank lines
-					cleanLines = append(cleanLines, line)
-				}
+		if err != nil {
+			content.WriteString(bodyStyle.Render(body))
+		} else {
+			rendered, err := r.Render(body)
+			if err != nil {
+				content.WriteString(bodyStyle.Render(body))
 			} else {
-				blankCount = 0
-				cleanLines = append(cleanLines, line)
+				// Clean up glamour output to remove excessive spacing
+				rendered = cleanupWhitespace(rendered)
+				// Remove extra newlines around code blocks that glamour sometimes adds
+				rendered = regexp.MustCompile(`\n{3,}\n`).ReplaceAllString(rendered, "\n\n```\n")
+				rendered = regexp.MustCompile(`\n\n{3,}`).ReplaceAllString(rendered, "\n```\n\n")
+				content.WriteString(rendered)
 			}
 		}
-
-		body = strings.Join(cleanLines, "\n")
-		content.WriteString(bodyStyle.Render(body))
 	} else {
 		content.WriteString(loadingStyle.Render("Loading email content..."))
 	}
