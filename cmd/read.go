@@ -41,7 +41,6 @@ var Read = &cli.Command{
 	},
 }
 
-// Email represents an email message
 type Email struct {
 	UID         uint32
 	Subject     string
@@ -72,32 +71,36 @@ func (e Email) Description() string {
 	return fmt.Sprintf("%s %s - %s", status, e.From, e.Date.Format("Jan 2, 15:04"))
 }
 
-// LoadMoreItem represents the "Load More" option
 type LoadMoreItem struct{}
 
 func (l LoadMoreItem) FilterValue() string { return "load more emails" }
 func (l LoadMoreItem) Title() string       { return "📥 Load More Emails..." }
 func (l LoadMoreItem) Description() string { return "Press Enter to load older emails" }
 
-// App represents the main application state
 type App struct {
-	username      string
-	password      string
-	host          string
-	port          string
-	client        *client.Client
-	emails        []Email
-	list          list.Model
-	viewport      viewport.Model
-	ready         bool
-	loading       bool
-	loadingMore   bool
-	err           error
-	state         appState
-	totalMessages uint32
-	emailsPerPage int
-	currentPage   int
-	hasMore       bool
+	username             string
+	password             string
+	host                 string
+	port                 string
+	client               *client.Client
+	emails               []Email
+	list                 list.Model
+	viewport             viewport.Model
+	ready                bool
+	loading              bool
+	loadingMore          bool
+	err                  error
+	state                appState
+	totalMessages        uint32
+	emailsPerPage        int
+	currentPage          int
+	hasMore              bool
+	showDeleteConfirm    bool
+	emailToDelete        *Email
+	deleteConfirmIndex   int
+	deletingEmail        bool
+	deleteSuccess        bool
+	deleteSuccessMessage string
 }
 
 type appState int
@@ -105,9 +108,9 @@ type appState int
 const (
 	listView appState = iota
 	emailView
+	deleteConfirmView
 )
 
-// Messages for tea program
 type emailsLoadedMsg struct {
 	emails        []Email
 	totalMessages uint32
@@ -117,6 +120,11 @@ type errorMsg error
 type emailBodyLoadedMsg struct {
 	uid  uint32
 	body Email
+}
+type emailDeletedMsg struct {
+	uid     uint32
+	success bool
+	message string
 }
 
 func NewApp(username, password, host, port string) *App {
@@ -177,13 +185,24 @@ func (a *App) loadEmailBody(uid uint32) tea.Cmd {
 	}
 }
 
+func (a *App) deleteEmail(uid uint32) tea.Cmd {
+	return func() tea.Msg {
+		success, message := moveEmailToTrash(a.client, uid)
+		a.deleteConfirmIndex = 0
+		return emailDeletedMsg{
+			uid:     uid,
+			success: success,
+			message: message,
+		}
+	}
+}
+
 func (a *App) updateEmailList() {
 	items := make([]list.Item, len(a.emails))
 	for i, email := range a.emails {
 		items[i] = email
 	}
 
-	// Add "Load More" item if there are more emails
 	if a.hasMore {
 		items = append(items, LoadMoreItem{})
 	}
@@ -211,18 +230,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.totalMessages = msg.totalMessages
 
 		if msg.isLoadMore {
-			// Append new emails to existing ones
 			a.emails = append(a.emails, msg.emails...)
 		} else {
-			// Replace emails for initial load
 			a.emails = msg.emails
 		}
 
-		// Calculate if there are more emails to load
 		loadedCount := len(a.emails)
 		a.hasMore = uint32(loadedCount) < a.totalMessages
 
-		// Update list title
 		title := fmt.Sprintf("📧 Email Inbox (%d of %d emails)", loadedCount, a.totalMessages)
 		if a.hasMore {
 			title += " • More available"
@@ -232,7 +247,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.updateEmailList()
 
 	case emailBodyLoadedMsg:
-		// Update the email body in our slice
 		for i, email := range a.emails {
 			if email.UID == msg.uid {
 				a.emails[i].Body = msg.body.Body
@@ -242,7 +256,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		// If we're viewing this email, update the viewport
 		if a.state == emailView && len(a.emails) > 0 && a.list.Index() < len(a.emails) {
 			selectedEmail := a.emails[a.list.Index()]
 			if selectedEmail.UID == msg.uid {
@@ -251,12 +264,73 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case emailDeletedMsg:
+		a.deletingEmail = false
+		a.showDeleteConfirm = false
+		a.state = listView
+
+		if msg.success {
+			for i, email := range a.emails {
+				if email.UID == msg.uid {
+					a.emails = append(a.emails[:i], a.emails[i+1:]...)
+					break
+				}
+			}
+			a.updateEmailList()
+
+			a.totalMessages--
+			title := fmt.Sprintf("📧 Email Inbox (%d of %d emails)", len(a.emails), a.totalMessages)
+			if a.hasMore {
+				title += " • More available"
+			}
+			a.list.Title = title
+
+			a.deleteSuccess = true
+			a.deleteSuccessMessage = msg.message
+
+			return a, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return clearSuccessMsg{}
+			})
+		} else {
+			a.err = fmt.Errorf("failed to delete email: %s", msg.message)
+		}
+
+	case clearSuccessMsg:
+		a.deleteSuccess = false
+		a.deleteSuccessMessage = ""
+
 	case errorMsg:
 		a.err = msg
 		a.loading = false
 		a.loadingMore = false
+		a.deletingEmail = false
 
 	case tea.KeyMsg:
+		if a.state == deleteConfirmView {
+			switch msg.String() {
+			case "left", "h", "right", "l":
+				if a.deleteConfirmIndex == 0 {
+					a.deleteConfirmIndex = 1
+				} else {
+					a.deleteConfirmIndex = 0
+				}
+			case "enter":
+				if a.deleteConfirmIndex == 1 && a.emailToDelete != nil {
+					a.deletingEmail = true
+					return a, a.deleteEmail(a.emailToDelete.UID)
+				} else {
+					a.showDeleteConfirm = false
+					a.state = listView
+					a.emailToDelete = nil
+				}
+			case "esc", "q":
+				a.showDeleteConfirm = false
+				a.state = listView
+				a.emailToDelete = nil
+			}
+			return a, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if a.client != nil {
@@ -268,7 +342,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.state == listView && a.list.Index() < len(a.list.Items()) {
 				selectedItem := a.list.SelectedItem()
 
-				// Check if it's the "Load More" item
 				if _, isLoadMore := selectedItem.(LoadMoreItem); isLoadMore {
 					if !a.loadingMore {
 						a.loadingMore = true
@@ -278,7 +351,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return a, nil
 				}
 
-				// It's a regular email
 				if a.list.Index() < len(a.emails) {
 					selectedEmail := a.emails[a.list.Index()]
 					a.state = emailView
@@ -297,8 +369,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.state = listView
 			}
 
+		case "d":
+			if (a.state == listView || a.state == emailView) && len(a.emails) > 0 {
+				var emailToDelete *Email
+
+				if a.state == emailView && a.list.Index() < len(a.emails) {
+					emailToDelete = &a.emails[a.list.Index()]
+				} else if a.state == listView && a.list.Index() < len(a.emails) {
+					selectedItem := a.list.SelectedItem()
+					if email, ok := selectedItem.(Email); ok {
+						emailToDelete = &email
+					}
+				}
+
+				if emailToDelete != nil {
+					a.emailToDelete = emailToDelete
+					a.showDeleteConfirm = true
+					a.state = deleteConfirmView
+				}
+			}
+
 		case "r":
-			// Refresh/reload emails from beginning
 			if a.state == listView && !a.loading {
 				a.loading = true
 				a.currentPage = 1
@@ -311,11 +402,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	if a.state == listView {
 		a.list, cmd = a.list.Update(msg)
-	} else {
+	} else if a.state == emailView {
 		a.viewport, cmd = a.viewport.Update(msg)
 	}
 	return a, cmd
 }
+
+type clearSuccessMsg struct{}
 
 func (a *App) View() string {
 	if a.err != nil {
@@ -330,28 +423,73 @@ func (a *App) View() string {
 		return loadingStyle.Render("Loading emails...\n\nPress 'q' to quit")
 	}
 
+	if a.state == deleteConfirmView && a.emailToDelete != nil {
+		return a.renderDeleteConfirmation()
+	}
+
 	switch a.state {
 	case listView:
 		view := a.list.View()
 		if len(a.emails) == 0 {
 			view = emptyStyle.Render("No emails found.\n\nPress 'q' to quit")
 		} else {
-			helpText := "↑/↓: navigate • enter: read • /: search • r: refresh • q: quit"
+			helpText := "↑/↓: navigate • enter: read • d: delete • /: search • r: refresh • q: quit"
 			if a.loadingMore {
 				helpText = "Loading more emails... • " + helpText
+			}
+			if a.deleteSuccess {
+				successMsg := successStyle.Render("✓ " + a.deleteSuccessMessage)
+				view += "\n" + successMsg
 			}
 			view += "\n" + helpStyle.Render(helpText)
 		}
 		return view
 
 	case emailView:
-		return a.viewport.View() + "\n" + helpStyle.Render("↑/↓: scroll • esc: back • q: quit")
+		helpText := "↑/↓: scroll • d: delete • esc: back • q: quit"
+		if a.deleteSuccess {
+			successMsg := successStyle.Render("✓ " + a.deleteSuccessMessage)
+			return a.viewport.View() + "\n" + successMsg + "\n" + helpStyle.Render(helpText)
+		}
+		return a.viewport.View() + "\n" + helpStyle.Render(helpText)
 	}
 
 	return ""
 }
 
-// Styles (unchanged)
+func (a *App) renderDeleteConfirmation() string {
+	if a.deletingEmail {
+		return loadingStyle.Render("Deleting email...\n\nPlease wait...")
+	}
+
+	var content strings.Builder
+
+	content.WriteString(warningStyle.Render("🗑️  Delete Email") + "\n\n")
+	content.WriteString("Are you sure you want to delete this email?\n\n")
+	content.WriteString(emailInfoStyle.Render(fmt.Sprintf("Subject: %s", a.emailToDelete.Subject)) + "\n")
+	content.WriteString(emailInfoStyle.Render(fmt.Sprintf("From: %s", a.emailToDelete.From)) + "\n")
+	content.WriteString(emailInfoStyle.Render(fmt.Sprintf("Date: %s", a.emailToDelete.Date.Format("Jan 2, 2006 15:04"))) + "\n\n")
+
+	content.WriteString("This will move the email to Trash.\n\n")
+
+	noButton := "[ No ]"
+	yesButton := "[ Yes ]"
+
+	if a.deleteConfirmIndex == 0 {
+		noButton = confirmButtonSelectedStyle.Render("[ No ]")
+		yesButton = confirmButtonStyle.Render("[ Yes ]")
+	} else {
+		noButton = confirmButtonStyle.Render("[ No ]")
+		yesButton = confirmButtonSelectedStyle.Render("[ Yes ]")
+	}
+
+	buttonsLine := lipgloss.JoinHorizontal(lipgloss.Center, noButton, "  ", yesButton)
+	content.WriteString(buttonsLine + "\n\n")
+	content.WriteString(helpStyle.Render("←/→: select • enter: confirm • esc: cancel"))
+
+	return dialogStyle.Render(content.String())
+}
+
 var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241")).
@@ -371,9 +509,6 @@ var (
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("238")).
 			Padding(1, 2)
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("39"))
 	subjectStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("205"))
@@ -384,9 +519,76 @@ var (
 			Foreground(lipgloss.Color("242"))
 	bodyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
+	successStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("46")).
+			Bold(true).
+			Padding(0, 1)
+	warningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("208")).
+			Bold(true)
+	dialogStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("208")).
+			Padding(2, 4).
+			MarginTop(2).
+			MarginLeft(4)
+	emailInfoStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+	confirmButtonStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("241")).
+				BorderStyle(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("241")).
+				Padding(0, 1)
+	confirmButtonSelectedStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("15")).
+					Background(lipgloss.Color("196")).
+					BorderStyle(lipgloss.RoundedBorder()).
+					BorderForeground(lipgloss.Color("196")).
+					Padding(0, 1).
+					Bold(true)
 )
 
-// Clean up excessive whitespace and formatting (unchanged)
+func moveEmailToTrash(imapClient *client.Client, uid uint32) (bool, string) {
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(uid)
+
+	trashFolders := []string{"Trash", "INBOX.Trash", "Deleted Messages", "INBOX.Deleted Messages"}
+
+	for _, trashFolder := range trashFolders {
+		_, err := imapClient.Select(trashFolder, false)
+		if err == nil {
+			_, err = imapClient.Select("INBOX", false)
+			if err != nil {
+				continue
+			}
+
+			err = imapClient.UidMove(seqSet, trashFolder)
+			if err == nil {
+				return true, fmt.Sprintf("Email moved to %s", trashFolder)
+			}
+		}
+	}
+
+	_, err := imapClient.Select("INBOX", false)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to select INBOX: %v", err)
+	}
+
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+	err = imapClient.UidStore(seqSet, item, flags, nil)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to mark email as deleted: %v", err)
+	}
+
+	err = imapClient.Expunge(nil)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to expunge: %v", err)
+	}
+
+	return true, "Email deleted permanently"
+}
+
 func cleanupWhitespace(text string) string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
@@ -402,7 +604,6 @@ func cleanupWhitespace(text string) string {
 	return text
 }
 
-// Updated fetchEmails function with pagination
 func fetchEmails(imapClient *client.Client, page int, perPage int) ([]Email, uint32, error) {
 	mailbox, err := imapClient.Select("INBOX", false)
 	if err != nil {
@@ -413,17 +614,14 @@ func fetchEmails(imapClient *client.Client, page int, perPage int) ([]Email, uin
 		return []Email{}, 0, nil
 	}
 
-	// Calculate range for this page
 	totalMessages := mailbox.Messages
 	end := totalMessages - uint32((page-1)*perPage)
 	start := end - uint32(perPage) + 1
 
-	// Ensure we don't go below 1
 	if start < 1 {
 		start = 1
 	}
 
-	// Ensure we don't exceed total messages
 	if end > totalMessages {
 		end = totalMessages
 	}
@@ -491,7 +689,6 @@ func fetchEmails(imapClient *client.Client, page int, perPage int) ([]Email, uin
 		})
 	}
 
-	// Sort by date (newest first)
 	sort.Slice(emails, func(i, j int) bool {
 		return emails[i].Date.After(emails[j].Date)
 	})
@@ -499,7 +696,6 @@ func fetchEmails(imapClient *client.Client, page int, perPage int) ([]Email, uin
 	return emails, totalMessages, nil
 }
 
-// Rest of the functions remain unchanged...
 func fetchEmailBodyParsed(imapClient *client.Client, uid uint32) (Email, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
