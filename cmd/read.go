@@ -31,11 +31,9 @@ var Read = &cli.Command{
 		password := os.Getenv("IMAP_PASSWORD")
 		host := os.Getenv("IMAP_HOST")
 		port := os.Getenv("IMAP_PORT")
-
 		if username == "" || password == "" || host == "" || port == "" {
 			return fmt.Errorf("please set IMAP_USERNAME, IMAP_PASSWORD, IMAP_HOST, and IMAP_PORT environment variables")
 		}
-
 		app := NewApp(username, password, host, port)
 		p := tea.NewProgram(app, tea.WithAltScreen())
 		_, err := p.Run()
@@ -58,12 +56,14 @@ type Email struct {
 }
 
 func (e Email) FilterValue() string { return e.Subject }
+
 func (e Email) Title() string {
 	if len(e.Subject) > 60 {
 		return e.Subject[:57] + "..."
 	}
 	return e.Subject
 }
+
 func (e Email) Description() string {
 	status := "🔵"
 	if e.Seen {
@@ -72,21 +72,32 @@ func (e Email) Description() string {
 	return fmt.Sprintf("%s %s - %s", status, e.From, e.Date.Format("Jan 2, 15:04"))
 }
 
+// LoadMoreItem represents the "Load More" option
+type LoadMoreItem struct{}
+
+func (l LoadMoreItem) FilterValue() string { return "load more emails" }
+func (l LoadMoreItem) Title() string       { return "📥 Load More Emails..." }
+func (l LoadMoreItem) Description() string { return "Press Enter to load older emails" }
+
 // App represents the main application state
 type App struct {
-	username string
-	password string
-	host     string
-	port     string
-
-	client   *client.Client
-	emails   []Email
-	list     list.Model
-	viewport viewport.Model
-	ready    bool
-	loading  bool
-	err      error
-	state    appState
+	username      string
+	password      string
+	host          string
+	port          string
+	client        *client.Client
+	emails        []Email
+	list          list.Model
+	viewport      viewport.Model
+	ready         bool
+	loading       bool
+	loadingMore   bool
+	err           error
+	state         appState
+	totalMessages uint32
+	emailsPerPage int
+	currentPage   int
+	hasMore       bool
 }
 
 type appState int
@@ -97,7 +108,11 @@ const (
 )
 
 // Messages for tea program
-type emailsLoadedMsg []Email
+type emailsLoadedMsg struct {
+	emails        []Email
+	totalMessages uint32
+	isLoadMore    bool
+}
 type errorMsg error
 type emailBodyLoadedMsg struct {
 	uid  uint32
@@ -105,45 +120,50 @@ type emailBodyLoadedMsg struct {
 }
 
 func NewApp(username, password, host, port string) *App {
-	// Initialize with empty list to prevent nil pointer issues
 	delegate := list.NewDefaultDelegate()
-	delegate.SetHeight(3) // Make items taller for better readability
-
+	delegate.SetHeight(3)
 	l := list.New([]list.Item{}, delegate, 0, 0)
 	l.Title = "📧 Email Inbox (Loading...)"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
-	l.SetFilteringEnabled(true)
 
 	return &App{
-		username: username,
-		password: password,
-		host:     host,
-		port:     port,
-		list:     l,
-		loading:  true,
-		state:    listView,
+		username:      username,
+		password:      password,
+		host:          host,
+		port:          port,
+		list:          l,
+		loading:       true,
+		state:         listView,
+		emailsPerPage: 50,
+		currentPage:   1,
 	}
 }
 
 func (a *App) Init() tea.Cmd {
-	return a.loadEmails()
+	return a.loadEmails(1, false)
 }
 
-func (a *App) loadEmails() tea.Cmd {
+func (a *App) loadEmails(page int, isLoadMore bool) tea.Cmd {
 	return func() tea.Msg {
-		client, err := connectToServer(a.username, a.password, a.host, a.port)
+		if a.client == nil {
+			client, err := connectToServer(a.username, a.password, a.host, a.port)
+			if err != nil {
+				return errorMsg(err)
+			}
+			a.client = client
+		}
+
+		emails, totalMessages, err := fetchEmails(a.client, page, a.emailsPerPage)
 		if err != nil {
 			return errorMsg(err)
 		}
-		a.client = client
 
-		emails, err := fetchEmails(client)
-		if err != nil {
-			return errorMsg(err)
+		return emailsLoadedMsg{
+			emails:        emails,
+			totalMessages: totalMessages,
+			isLoadMore:    isLoadMore,
 		}
-
-		return emailsLoadedMsg(emails)
 	}
 }
 
@@ -155,6 +175,20 @@ func (a *App) loadEmailBody(uid uint32) tea.Cmd {
 		}
 		return emailBodyLoadedMsg{uid: uid, body: email}
 	}
+}
+
+func (a *App) updateEmailList() {
+	items := make([]list.Item, len(a.emails))
+	for i, email := range a.emails {
+		items[i] = email
+	}
+
+	// Add "Load More" item if there are more emails
+	if a.hasMore {
+		items = append(items, LoadMoreItem{})
+	}
+
+	a.list.SetItems(items)
 }
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -173,15 +207,29 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case emailsLoadedMsg:
 		a.loading = false
-		a.emails = []Email(msg)
-		a.list.Title = fmt.Sprintf("📧 Email Inbox (%d emails)", len(a.emails))
+		a.loadingMore = false
+		a.totalMessages = msg.totalMessages
 
-		items := make([]list.Item, len(a.emails))
-		for i, email := range a.emails {
-			items[i] = email
+		if msg.isLoadMore {
+			// Append new emails to existing ones
+			a.emails = append(a.emails, msg.emails...)
+		} else {
+			// Replace emails for initial load
+			a.emails = msg.emails
 		}
 
-		a.list.SetItems(items)
+		// Calculate if there are more emails to load
+		loadedCount := len(a.emails)
+		a.hasMore = uint32(loadedCount) < a.totalMessages
+
+		// Update list title
+		title := fmt.Sprintf("📧 Email Inbox (%d of %d emails)", loadedCount, a.totalMessages)
+		if a.hasMore {
+			title += " • More available"
+		}
+		a.list.Title = title
+
+		a.updateEmailList()
 
 	case emailBodyLoadedMsg:
 		// Update the email body in our slice
@@ -194,7 +242,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-
 		// If we're viewing this email, update the viewport
 		if a.state == emailView && len(a.emails) > 0 && a.list.Index() < len(a.emails) {
 			selectedEmail := a.emails[a.list.Index()]
@@ -207,6 +254,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errorMsg:
 		a.err = msg
 		a.loading = false
+		a.loadingMore = false
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -217,22 +265,45 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, tea.Quit
 
 		case "enter":
-			if a.state == listView && len(a.emails) > 0 && a.list.Index() < len(a.emails) {
-				selectedEmail := a.emails[a.list.Index()]
-				a.state = emailView
+			if a.state == listView && a.list.Index() < len(a.list.Items()) {
+				selectedItem := a.list.SelectedItem()
 
-				if selectedEmail.Body == "" {
-					a.viewport.SetContent(formatEmailForView(selectedEmail))
-					return a, a.loadEmailBody(selectedEmail.UID)
-				} else {
-					content := formatEmailForView(selectedEmail)
-					a.viewport.SetContent(content)
+				// Check if it's the "Load More" item
+				if _, isLoadMore := selectedItem.(LoadMoreItem); isLoadMore {
+					if !a.loadingMore {
+						a.loadingMore = true
+						a.currentPage++
+						return a, a.loadEmails(a.currentPage, true)
+					}
+					return a, nil
+				}
+
+				// It's a regular email
+				if a.list.Index() < len(a.emails) {
+					selectedEmail := a.emails[a.list.Index()]
+					a.state = emailView
+					if selectedEmail.Body == "" {
+						a.viewport.SetContent(formatEmailForView(selectedEmail))
+						return a, a.loadEmailBody(selectedEmail.UID)
+					} else {
+						content := formatEmailForView(selectedEmail)
+						a.viewport.SetContent(content)
+					}
 				}
 			}
 
 		case "esc", "backspace":
 			if a.state == emailView {
 				a.state = listView
+			}
+
+		case "r":
+			// Refresh/reload emails from beginning
+			if a.state == listView && !a.loading {
+				a.loading = true
+				a.currentPage = 1
+				a.list.Title = "📧 Email Inbox (Refreshing...)"
+				return a, a.loadEmails(1, false)
 			}
 		}
 	}
@@ -243,7 +314,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	} else {
 		a.viewport, cmd = a.viewport.Update(msg)
 	}
-
 	return a, cmd
 }
 
@@ -266,9 +336,14 @@ func (a *App) View() string {
 		if len(a.emails) == 0 {
 			view = emptyStyle.Render("No emails found.\n\nPress 'q' to quit")
 		} else {
-			view += "\n" + helpStyle.Render("↑/↓: navigate • enter: read • /: search • q: quit")
+			helpText := "↑/↓: navigate • enter: read • /: search • r: refresh • q: quit"
+			if a.loadingMore {
+				helpText = "Loading more emails... • " + helpText
+			}
+			view += "\n" + helpStyle.Render(helpText)
 		}
 		return view
+
 	case emailView:
 		return a.viewport.View() + "\n" + helpStyle.Render("↑/↓: scroll • esc: back • q: quit")
 	}
@@ -276,95 +351,86 @@ func (a *App) View() string {
 	return ""
 }
 
-// Styles
+// Styles (unchanged)
 var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241")).
 			Padding(0, 1)
-
 	loadingStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("205")).
 			Bold(true).
 			Padding(1, 2)
-
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
 			Bold(true).
 			Padding(1, 2)
-
 	emptyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("243")).
 			Padding(1, 2)
-
 	emailViewStyle = lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("238")).
 			Padding(1, 2)
-
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("39"))
-
 	subjectStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("205"))
-
 	fromStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("220"))
-
 	dateStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("242"))
-
 	bodyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 )
 
-// Clean up excessive whitespace and formatting
+// Clean up excessive whitespace and formatting (unchanged)
 func cleanupWhitespace(text string) string {
-	// Normalize line endings
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
-
-	// Remove trailing spaces from lines
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		lines[i] = strings.TrimRight(line, " \t")
 	}
 	text = strings.Join(lines, "\n")
-
-	// Reduce multiple consecutive blank lines to maximum of 2
 	for strings.Contains(text, "\n\n\n\n") {
 		text = strings.ReplaceAll(text, "\n\n\n\n", "\n\n\n")
 	}
-
-	// Remove leading/trailing whitespace
 	text = strings.TrimSpace(text)
-
 	return text
 }
 
-// Smart email fetching - load headers first, bodies on demand
-func fetchEmails(imapClient *client.Client) ([]Email, error) {
+// Updated fetchEmails function with pagination
+func fetchEmails(imapClient *client.Client, page int, perPage int) ([]Email, uint32, error) {
 	mailbox, err := imapClient.Select("INBOX", false)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if mailbox.Messages == 0 {
-		return []Email{}, nil
+		return []Email{}, 0, nil
 	}
 
-	// Fetch most recent 50 emails (or all if less than 50)
-	start := uint32(1)
-	if mailbox.Messages > 50 {
-		start = mailbox.Messages - 49
+	// Calculate range for this page
+	totalMessages := mailbox.Messages
+	end := totalMessages - uint32((page-1)*perPage)
+	start := end - uint32(perPage) + 1
+
+	// Ensure we don't go below 1
+	if start < 1 {
+		start = 1
+	}
+
+	// Ensure we don't exceed total messages
+	if end > totalMessages {
+		end = totalMessages
 	}
 
 	seqSet := new(imap.SeqSet)
-	seqSet.AddRange(start, mailbox.Messages)
+	seqSet.AddRange(start, end)
 
-	// Only fetch headers initially for performance
 	items := []imap.FetchItem{
 		imap.FetchEnvelope,
 		imap.FetchFlags,
@@ -372,7 +438,6 @@ func fetchEmails(imapClient *client.Client) ([]Email, error) {
 	}
 
 	messages := make(chan *imap.Message, 10)
-
 	go func() {
 		if err := imapClient.Fetch(seqSet, items, messages); err != nil {
 			log.Printf("Error fetching messages: %v", err)
@@ -431,25 +496,21 @@ func fetchEmails(imapClient *client.Client) ([]Email, error) {
 		return emails[i].Date.After(emails[j].Date)
 	})
 
-	return emails, nil
+	return emails, totalMessages, nil
 }
 
-// Fetch and parse email body with proper HTML handling
+// Rest of the functions remain unchanged...
 func fetchEmailBodyParsed(imapClient *client.Client, uid uint32) (Email, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uid)
-
 	section := &imap.BodySectionName{}
 	items := []imap.FetchItem{section.FetchItem()}
-
 	messages := make(chan *imap.Message, 1)
-
 	go func() {
 		if err := imapClient.UidFetch(seqSet, items, messages); err != nil {
 			log.Printf("Error fetching message body: %v", err)
 		}
 	}()
-
 	var email Email
 	for msg := range messages {
 		for _, value := range msg.Body {
@@ -458,11 +519,8 @@ func fetchEmailBodyParsed(imapClient *client.Client, uid uint32) (Email, error) 
 				if err != nil {
 					return email, err
 				}
-
-				// Parse the email
 				parsedEmail, err := parseEmailBody(string(rawBody))
 				if err != nil {
-					// Fallback to raw body if parsing fails
 					email.Body = string(rawBody)
 					email.ContentType = "text/plain"
 				} else {
@@ -472,33 +530,24 @@ func fetchEmailBodyParsed(imapClient *client.Client, uid uint32) (Email, error) 
 			}
 		}
 	}
-
 	return email, fmt.Errorf("could not load email body")
 }
 
-// Parse email body and extract HTML/Text parts
 func parseEmailBody(rawBody string) (Email, error) {
 	var email Email
-
-	// Parse the email message
 	msg, err := mail.ReadMessage(strings.NewReader(rawBody))
 	if err != nil {
 		return email, err
 	}
-
 	contentType := msg.Header.Get("Content-Type")
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		mediaType = "text/plain"
 	}
-
 	email.ContentType = mediaType
-
 	if strings.HasPrefix(mediaType, "multipart/") {
-		// Handle multipart messages
 		boundary := params["boundary"]
 		reader := multipart.NewReader(msg.Body, boundary)
-
 		for {
 			part, err := reader.NextPart()
 			if err == io.EOF {
@@ -507,15 +556,12 @@ func parseEmailBody(rawBody string) (Email, error) {
 			if err != nil {
 				continue
 			}
-
 			partBody, err := io.ReadAll(part)
 			if err != nil {
 				continue
 			}
-
 			partContentType := part.Header.Get("Content-Type")
 			partMediaType, _, _ := mime.ParseMediaType(partContentType)
-
 			switch {
 			case strings.HasPrefix(partMediaType, "text/html"):
 				email.HTMLBody = string(partBody)
@@ -524,20 +570,16 @@ func parseEmailBody(rawBody string) (Email, error) {
 			}
 		}
 	} else {
-		// Handle single part messages
 		body, err := io.ReadAll(msg.Body)
 		if err != nil {
 			return email, err
 		}
-
 		if strings.HasPrefix(mediaType, "text/html") {
 			email.HTMLBody = string(body)
 		} else {
 			email.TextBody = string(body)
 		}
 	}
-
-	// Convert HTML to Markdown if we have HTML content
 	if email.TextBody != "" {
 		email.Body = email.TextBody
 	} else {
@@ -545,37 +587,25 @@ func parseEmailBody(rawBody string) (Email, error) {
 			email.Body = email.HTMLBody
 		}
 	}
-
 	return email, nil
 }
 
 func formatEmailForView(email Email) string {
 	var content strings.Builder
-
-	// Header section
 	content.WriteString(subjectStyle.Render("📧 ") + subjectStyle.Render(email.Subject) + "\n\n")
-
 	content.WriteString(fromStyle.Render("From: ") + email.From + "\n")
 	if email.To != "" {
 		content.WriteString(fromStyle.Render("To: ") + email.To + "\n")
 	}
 	content.WriteString(dateStyle.Render("Date: ") + email.Date.Format("Monday, January 2, 2006 at 3:04 PM") + "\n\n")
-
-	// Separator
 	content.WriteString(strings.Repeat("─", 60) + "\n\n")
-
-	// Body
 	if email.Body != "" {
-		// Clean up the body text
 		body := strings.TrimSpace(email.Body)
 		body = cleanupWhitespace(body)
-
-		// Create glamour renderer with auto-style
 		r, err := glamour.NewTermRenderer(
 			glamour.WithAutoStyle(),
 			glamour.WithWordWrap(80),
 		)
-
 		if err != nil {
 			content.WriteString(bodyStyle.Render(body))
 		} else {
@@ -583,9 +613,7 @@ func formatEmailForView(email Email) string {
 			if err != nil {
 				content.WriteString(bodyStyle.Render(body))
 			} else {
-				// Clean up glamour output to remove excessive spacing
 				rendered = cleanupWhitespace(rendered)
-				// Remove extra newlines around code blocks that glamour sometimes adds
 				rendered = regexp.MustCompile(`\n{3,}\n`).ReplaceAllString(rendered, "\n\n```\n")
 				rendered = regexp.MustCompile(`\n\n{3,}`).ReplaceAllString(rendered, "\n```\n\n")
 				content.WriteString(rendered)
@@ -594,7 +622,6 @@ func formatEmailForView(email Email) string {
 	} else {
 		content.WriteString(loadingStyle.Render("Loading email content..."))
 	}
-
 	return content.String()
 }
 
@@ -603,10 +630,8 @@ func connectToServer(username, password, host, port string) (*client.Client, err
 	if err != nil {
 		return nil, err
 	}
-
 	if err := c.Login(username, password); err != nil {
 		return nil, err
 	}
-
 	return c, nil
 }
